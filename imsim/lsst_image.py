@@ -317,26 +317,28 @@ class LSST_PhotonPoolingImageBuilder(LSST_ImageBuilderBase):
         all_stamps = []
         all_vars = []
         all_obj_nums = []
-        photon_batch_num = 0
+        current_photon_batch_num = 0
 
         full_image = None
 
         if self.checkpoint is not None:
-            chk_name = "buildImage_" + self.det_name
-            full_image, all_vars, all_stamps, all_obj_nums, photon_batch_num = load_checkpoint(self.checkpoint, chk_name, base, logger)
+            chk_name = "buildImage_photonpooling_" + self.det_name
+            full_image, all_vars, all_stamps, all_obj_nums, current_photon_batch_num = load_checkpoint(self.checkpoint, chk_name, base, logger)
         remaining_obj_nums = sorted(frozenset(range(self.nobjects)) - frozenset(all_obj_nums))
 
         if full_image is None:
             full_image = create_full_image(config, base)
 
-        # Ensure 1 <= nbatch <= len(remaining_obj_nums)
-        n_fft_batch = max(min(self.nbatch, len(remaining_obj_nums)), 1)
         sensor = base.get('sensor', None)
         rng = galsim.config.GetRNG(config, base, logger, "LSST_Silicon")
         if sensor is not None:
             sensor.updateRNG(rng)
+
+        # Create partitions each containing one of the three classes of object.
         fft_objects, phot_objects, faint_objects = partition_objects(load_objects(remaining_obj_nums, config, base, logger))
         logger.info("Found %d FFT objects, %d photon shooting objects and %d faint objects", len(fft_objects), len(phot_objects), len(faint_objects))
+        # Ensure 1 <= nbatch <= len(fft_objects)
+        n_fft_batch = max(min(self.nbatch, len(fft_objects)), 1)
         if self.checkpoint is not None:
             if not fft_objects:
                 logger.warning('All FFT objects already rendered for this image.')
@@ -369,31 +371,37 @@ class LSST_PhotonPoolingImageBuilder(LSST_ImageBuilderBase):
             all_vars.extend([current_vars[k] for k in nz_var])
 
             if self.checkpoint is not None:
-                save_checkpoint(self.checkpoint, chk_name, base, full_image, all_stamps, all_vars, all_obj_nums, photon_batch_num)
+                save_checkpoint(self.checkpoint, chk_name, base, full_image, all_stamps, all_vars, all_obj_nums, current_photon_batch_num)
                 logger.warning('File %d: Completed batch %d, and wrote '
                                'checkpoint data to %s',
                                base.get('file_num', 0), batch_num,
                                self.checkpoint.file_name)
-        # Handle photons:
+
+        # Ensure 1 <= nbatch <= len(phot_objects) and make batches.
+        n_photon_batch = max(min(self.nbatch, len(phot_objects)), 1)
         phot_batches = make_photon_batches(
-                config, base, logger, phot_objects, faint_objects, self.nbatch
+                config, base, logger, phot_objects, faint_objects, n_photon_batch
             )
 
-        if photon_batch_num > 0:
+        if current_photon_batch_num > 0:
             logger.warning(
                 "Photon batches [0, %d) / %d already rendered - skipping",
-                photon_batch_num,
-                self.nbatch,
+                current_photon_batch_num,
+                n_photon_batch,
             )
-            phot_batches = phot_batches[photon_batch_num:]
+            phot_batches = phot_batches[current_photon_batch_num:]
         photon_ops_cfg = {"photon_ops": base.get("stamp", {}).get("photon_ops", [])}
         photon_ops = galsim.config.BuildPhotonOps(photon_ops_cfg, 'photon_ops', base, logger)
         local_wcs = base["wcs"].local(galsim.position._PositionD(0., 0.)).shiftOrigin(galsim.position._PositionD(-0.5, -0.5))
         base["image_pos"].x = full_image.center.x
         base["image_pos"].y = full_image.center.y
-        for batch_num, batch in enumerate(phot_batches, start=photon_batch_num):
+        for batch_num, batch in enumerate(phot_batches, start=current_photon_batch_num):
             if not batch:
                 continue
+            if n_photon_batch > 1:
+                logger.warning("Starting photon batch %d/%d.",
+                               batch_num+1, n_photon_batch)
+                
             base['index_key'] = 'image_num'
             stamps, current_vars = build_stamps(base, logger, batch, stamp_type="PhotonStampBuilder")
             photons = merge_photon_arrays(stamps)
@@ -558,14 +566,18 @@ def set_config_image_pos(config, base):
 def load_checkpoint(checkpoint, chk_name, base, logger):
     saved = checkpoint.load(chk_name)
     if saved is not None:
+        # If the checkpoint exists, get the stored information and prepare it for use.
         full_image, all_bounds, all_vars, all_obj_nums, extra_builder, photon_batch_num = saved
         if extra_builder is not None:
             base['extra_builder'] = extra_builder
+        # Create stamps from the bounds provided by the checkpoint.
         all_stamps = [galsim._Image(np.array([]), b, full_image.wcs) for b in all_bounds]
         logger.warning('File %d: Loaded checkpoint data from %s.',
                        base.get('file_num', 0), checkpoint.file_name)
         return full_image, all_vars, all_stamps, all_obj_nums, photon_batch_num
-    return (None,)*5
+    else:
+        # Return empty objects if the checkpoint doesn't (yet) exist.
+        return None, [], [], [], 0
 
 def save_checkpoint(checkpoint, chk_name, base, full_image, all_stamps, all_vars, all_obj_nums, photon_batch_num):
     # Don't save the full stamps.  All we need for FlattenNoiseVariance is the bounds.
