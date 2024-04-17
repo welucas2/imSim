@@ -28,6 +28,7 @@ class StellarObject:
     index: int
     gal: object
     psf: object
+    offset: object
     phot_flux: float
     fft_flux: float
     mode: ProcessingMode
@@ -98,7 +99,7 @@ def build_obj(stamp_config, base, logger):
     else:
         mode = ProcessingMode.PHOT
 
-    return StellarObject(base.get('obj_num', 0), builder.gal, psf, phot_flux=builder.phot_flux, fft_flux=builder.fft_flux, mode=mode)
+    return StellarObject(base.get('obj_num', 0), builder.gal, psf, base["stamp_offset"], phot_flux=builder.phot_flux, fft_flux=builder.fft_flux, mode=mode)
 
 
 class StampBuilderBase(StampBuilder):
@@ -839,7 +840,6 @@ class LSST_SiliconBuilder(StampBuilderBase):
             # For photon shooting, use the poisson-realization of the flux
             # and tell GalSim not to redo the Poisson realization.
             gal = gal.withFlux(self.phot_flux, bandpass)
-
             if not faint and 'photon_ops' in config:
                 photon_ops = galsim.config.BuildPhotonOps(config, 'photon_ops', base, logger)
             else:
