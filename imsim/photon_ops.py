@@ -3,10 +3,10 @@
 from functools import lru_cache
 import numpy as np
 
-import galsim
 import batoid
-from galsim import PhotonArray, PhotonOp, GaussianDeviate
+from galsim import Bandpass, PhotonArray, PhotonOp, GaussianDeviate
 from galsim.config import RegisterPhotonOpType, PhotonOpBuilder, GetAllParams
+from galsim.config import BuildBandpass, GalSimConfigError
 from galsim.celestial import CelestialCoord
 from galsim.config.util import get_cls_params
 from coord import Angle
@@ -498,3 +498,36 @@ def ray_vector_to_photon_array(
     out.dxdz, out.dydz = (out.dxdz.ravel(), out.dydz.ravel())
     out.flux[ray_vector.vignetted] = 0.0
     return out
+
+
+class BandpassRatio(PhotonOp):
+    """Photon operator that reweights photon fluxes to effect
+    a specified bandpass from photons initially sampled from
+    a different bandpass.
+    """
+    def __init__(
+        self,
+        target_bandpass: Bandpass,
+        initial_bandpass: Bandpass
+    ):
+        self.target = target_bandpass
+        self.initial = initial_bandpass
+        self.ratio = self.target / self.initial
+
+    def applyTo(self, photon_array, local_wcs=None, rng=None):
+        photon_array.flux *= self.ratio(photon_array.wavelength)
+
+
+class BandpassRatioBuilder(PhotonOpBuilder):
+    def buildPhotonOp(self, config, base, logger):
+        if 'target_bandpass' not in config:
+            raise GalSimConfigError("target_bandpass is required for BandpassRatio")
+        if 'initial_bandpass' not in config:
+            raise GalSimConfigError("initial_bandpass is required for BandpassRatio")
+        kwargs = {}
+        kwargs['target_bandpass'] = BuildBandpass(config, 'target_bandpass', base, logger)[0]
+        kwargs['initial_bandpass'] = BuildBandpass(config, 'initial_bandpass', base, logger)[0]
+        return BandpassRatio(**kwargs)
+
+
+RegisterPhotonOpType('BandpassRatio', BandpassRatioBuilder())

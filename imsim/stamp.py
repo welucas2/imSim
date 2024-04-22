@@ -9,7 +9,7 @@ from lsst.obs.lsst.translators.lsst import SIMONYI_LOCATION as RUBIN_LOC
 
 from .diffraction_fft import apply_diffraction_psf
 from .camera import get_camera
-
+from .photon_ops import BandpassRatio
 
 class ProcessingMode(Enum):
     FFT = auto()
@@ -335,14 +335,25 @@ class LSST_SiliconBuilder(StampBuilderBase):
         camera = get_camera(params.get('camera', 'LsstCam'))
         if self.vignetting:
             self.det = camera[params['det_name']]
-        if stellar_obj is not None:
-            self.nominal_flux = stellar_obj.gal.flux
-            self.phot_flux = stellar_obj.phot_flux
+        if hasattr(gal, 'flux'):
+            # In this case, the object flux has been precomputed.  If our
+            # realized bandpass is different from the fiducial bandpass used
+            # in the precomputation, then we'll need to reweight the flux.
+            # We'll only do this if the bandpass was obtained from
+            # RubinBandpass though.
+            self.fiducial_bandpass = base.get('fiducial_bandpass', None)
+            self.do_reweight = (
+                self.fiducial_bandpass is not None
+                and self.fiducial_bandpass != bandpass
+            )
         else:
-            self.nominal_flux = gal.flux
-            # For photon shooting rendering, precompute the realization of the Poisson variate.
-            # Mostly so we can possibly abort early if phot_flux=0.
-            self.phot_flux = galsim.PoissonDeviate(self.rng, mean=gal.flux)()
+            gal.flux = gal.calculateFlux(bandpass)
+            self.do_reweight = False
+        self.nominal_flux = gal.flux
+
+        # For photon shooting rendering, precompute the realization of the Poisson variate.
+        # Mostly so we can possibly abort early if phot_flux=0.
+        self.phot_flux = galsim.PoissonDeviate(self.rng, mean=gal.flux)()
 
         # Save these later, in case needed for the output catalog.
         base['nominal_flux'] = self.nominal_flux
@@ -508,7 +519,7 @@ class LSST_SiliconBuilder(StampBuilderBase):
                 else:
                     obj_list.append(item)
             obj = galsim.Add(obj_list)
-        elif isinstance(obj.original, galsim.RandomKnots):
+        elif hasattr(obj, 'original') and isinstance(obj.original, galsim.RandomKnots):
             # Handle RandomKnots object directly
             obj = obj.original._profile
 
@@ -751,6 +762,12 @@ class LSST_SiliconBuilder(StampBuilderBase):
         max_flux_simple = config.get('max_flux_simple', 100)
         faint = self.nominal_flux < max_flux_simple
         bandpass = base['bandpass']
+
+        if self.do_reweight:
+            initial_flux_bandpass = self.fiducial_bandpass
+        else:
+            initial_flux_bandpass = base['bandpass']
+
         if faint:
             logger.info("Flux = %.0f  Using trivial sed", self.nominal_flux)
             # cosmoDC2 galaxies with z > 2.71 and some SNANA objects
@@ -765,7 +782,7 @@ class LSST_SiliconBuilder(StampBuilderBase):
                 if sed_value != 0:
                     break
             if sed_value == 0:
-                # We can't evalue the profile for this object, so skip it.
+                # We can't evaluate the profile for this object, so skip it.
                 obj_num = base.get('obj_num')
                 object_id = base.get('object_id')
                 logger.warning("Zero-valued SED for faint object %d, "
@@ -790,10 +807,8 @@ class LSST_SiliconBuilder(StampBuilderBase):
             maxN = galsim.config.ParseValue(config, 'maxN', base, int)[0]
 
         if method == 'fft':
-            # For FFT, we may have adjusted the flux to account for vignetting.
-            # So update the flux to self.fft_flux if it's different.
             if self.fft_flux != self.nominal_flux:
-                gal = gal.withFlux(self.fft_flux, bandpass)
+                gal = gal.withFlux(self.fft_flux, initial_flux_bandpass)
 
             fft_image = image.copy()
             fft_offset = offset
@@ -839,11 +854,26 @@ class LSST_SiliconBuilder(StampBuilderBase):
         else:
             # For photon shooting, use the poisson-realization of the flux
             # and tell GalSim not to redo the Poisson realization.
-            gal = gal.withFlux(self.phot_flux, bandpass)
+            # Use the initial_flux_bandpass here, and use a photon op to get to the realized
+            # bandpass below.
+            gal = gal.withFlux(self.phot_flux, initial_flux_bandpass)
+
             if not faint and 'photon_ops' in config:
                 photon_ops = galsim.config.BuildPhotonOps(config, 'photon_ops', base, logger)
             else:
                 photon_ops = []
+
+            if self.do_reweight:
+                photon_ops.append(
+                    BandpassRatio(
+                        target_bandpass=bandpass,
+                        initial_bandpass=self.fiducial_bandpass,
+                    )
+                )
+                bp_for_drawImage = self.fiducial_bandpass
+            else:
+                bp_for_drawImage = bandpass
+
             # Put the psfs at the start of the photon_ops.
             # Probably a little better to put them a bit later than the start in some cases
             # (e.g. after TimeSampler, PupilAnnulusSampler), but leave that as a todo for now.
@@ -856,7 +886,7 @@ class LSST_SiliconBuilder(StampBuilderBase):
                 if sensor is not None:
                     sensor.updateRNG(self.rng)
 
-            image = gal.drawImage(bandpass,
+            image = gal.drawImage(bp_for_drawImage,
                                   method='phot',
                                   offset=offset,
                                   rng=self.rng,

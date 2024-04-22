@@ -1,5 +1,6 @@
-import logging
 import numpy as np
+import hashlib
+import logging
 import galsim
 from galsim.config import RegisterImageType, GetAllParams, GetSky, AddNoise
 from galsim.config.image_scattered import ScatteredImageBuilder
@@ -49,7 +50,14 @@ class LSST_ImageBuilderBase(ScatteredImageBuilder):
                      image_num,image_num,obj_num)
 
         self.nobjects = self.getNObj(config, base, image_num, logger=logger)
-        logger.debug('image %d: nobj = %d',image_num,self.nobjects)
+        if 'nobjects' in config:
+            # User specified nobjects.
+            # Make sure it's not more than what any input catalog can
+            # handle (we don't want repeated objects).
+            input_nobj = galsim.config.ProcessInputNObjects(base)
+            if input_nobj is not None:
+                self.nobjects = min(self.nobjects, input_nobj)
+        logger.info('image %d: nobj = %d', image_num, self.nobjects)
 
         # These are allowed for LSST_Image, but we don't use them here.
         extra_ignore = [ 'image_pos', 'world_pos', 'stamp_size', 'stamp_xsize', 'stamp_ysize',
@@ -58,7 +66,8 @@ class LSST_ImageBuilderBase(ScatteredImageBuilder):
         opt = { 'size': int , 'xsize': int , 'ysize': int, 'dtype': None,
                  'apply_sky_gradient': bool, 'apply_fringing': bool,
                  'boresight': galsim.CelestialCoord, 'camera': str, 'nbatch': int,
-                 'nbatch_fft': int, 'nbatch_photon': int}
+                 'nbatch_fft': int, 'nbatch_photon': int,
+                 'nbatch_per_checkpoint': int}
         params = GetAllParams(config, base, req=req, opt=opt, ignore=ignore+extra_ignore)[0]
 
         # Let the user override the image size
@@ -101,15 +110,16 @@ class LSST_ImageBuilderBase(ScatteredImageBuilder):
         # keep the default value as 100.
         # nbatch is used for LSST_Image runs.
         self.nbatch = params.get('nbatch', 100)
+        try:
+            self.checkpoint = galsim.config.GetInputObj('checkpoint', config, base, 'LSST_Image')
+            self.nbatch_per_checkpoint = params.get('nbatch_per_checkpoint', 1)
+        except galsim.config.GalSimConfigError:
+            self.checkpoint = None
         # nbatch_fft and nbatch_photon are used for LSST_PhotonPoolingImage runs.
         # The default behaviour for photon pooling is to process all FFT objects in one pass
         # and the photon objects in 10.
         self.nbatch_fft = params.get('nbatch_fft', 1)
         self.nbatch_photon = params.get('nbatch_photon', 10)
-        try:
-            self.checkpoint = galsim.config.GetInputObj('checkpoint', config, base, 'LSST_Image')
-        except galsim.config.GalSimConfigError:
-            self.checkpoint = None
 
         return xsize, ysize
 
@@ -169,11 +179,15 @@ class LSST_ImageBuilderBase(ScatteredImageBuilder):
             camera = get_camera(self.camera_name)
             det_name = base['det_name']
             serial_number = camera[det_name].getSerial()
+            # Note: the regular Python hash function is non-deterministic, which is not good.
+            # Instead we use hashlib.sha256, which is deterministic and convert that to an integer.
+            # https://stackoverflow.com/questions/27954892/deterministic-hashing-in-python-3
+            seed = int(hashlib.sha256(serial_number.encode('UTF-8')).hexdigest(), 16) & 0xFFFFFFFF
             # Only apply fringing to e2v sensors.
             if serial_number[:3] == 'E2V':
                 ccd_fringing = CCD_Fringing(true_center=image.wcs.toWorld(image.true_center),
                                             boresight=self.boresight,
-                                            seed=hash(serial_number), spatial_vary=True)
+                                            seed=seed, spatial_vary=True)
                 ny, nx = sky.array.shape
                 xarr, yarr = np.meshgrid(range(nx), range(ny))
                 logger.info("Apply fringing")
@@ -211,6 +225,7 @@ class LSST_ImageBuilder(LSST_ImageBuilderBase):
         set_config_image_pos(config, base)
 
         full_image = None
+        current_var = 0
         start_num = obj_num
 
         # For cases where there is noise in individual stamps, we need to keep track of the
@@ -223,7 +238,8 @@ class LSST_ImageBuilder(LSST_ImageBuilderBase):
             chk_name = 'buildImage_%s'%(self.det_name)
             saved = self.checkpoint.load(chk_name)
             if saved is not None:
-                full_image, all_bounds, all_vars, start_num, extra_builder = saved
+                full_image, all_bounds, all_vars, delta_start_num, extra_builder = saved
+                start_num = delta_start_num + base.get('start_obj_num', 0)
                 if extra_builder is not None:
                     base['extra_builder'] = extra_builder
                 all_stamps = [galsim._Image(np.array([]), b, full_image.wcs) for b in all_bounds]
@@ -249,6 +265,7 @@ class LSST_ImageBuilder(LSST_ImageBuilderBase):
 
         if full_image is None:
             full_image = create_full_image(config, base)
+            start_batch = 0
 
         # Ensure 1 <= nbatch <= nobj_tot
         nbatch = max(min(self.nbatch, nobj_tot), 1)
@@ -290,13 +307,15 @@ class LSST_ImageBuilder(LSST_ImageBuilderBase):
                 # Don't save the full stamps.  All we need for FlattenNoiseVariance is the bounds.
                 # Everything else about the stamps has already been handled above.
                 all_bounds = [stamp.bounds for stamp in all_stamps]
-                data = (full_image, all_bounds, all_vars, end_obj_num,
+                delta_end_obj_num = end_obj_num - base.get('start_obj_num', 0)
+                data = (full_image, all_bounds, all_vars, delta_end_obj_num,
                         base.get('extra_builder',None))
-                self.checkpoint.save(chk_name, data)
-                logger.warning('File %d: Completed batch %d with objects [%d, %d), and wrote '
-                               'checkpoint data to %s',
-                               base.get('file_num', 0), batch+1, start_obj_num, end_obj_num,
-                               self.checkpoint.file_name)
+                logger.warning('File %d: Completed batch %d with objects [%d, %d)',
+                               base.get('file_num', 0), batch+1, start_obj_num, end_obj_num)
+                if (batch % self.nbatch_per_checkpoint == 0
+                    or batch + 1 == nbatch):
+                    self.checkpoint.save(chk_name, data)
+                    logger.warning('Wrote checkpoint data to %s', self.checkpoint.file_name)
 
         # Bring the image so far up to a flat noise variance
         current_var = galsim.config.FlattenNoiseVariance(

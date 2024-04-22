@@ -6,9 +6,10 @@ from collections import namedtuple
 from astropy.io import fits
 from astropy.time import Time
 import galsim
-from galsim.config import ExtraOutputBuilder, RegisterExtraOutput, GetAllParams
+from galsim.config import ExtraOutputBuilder, RegisterExtraOutput, GetAllParams, ParseValue
 from lsst.afw import cameraGeom
 import lsst.obs.lsst
+from lsst.obs.lsst.translators.lsst import SIMONYI_TELESCOPE
 from .bleed_trails import bleed_eimage
 from .camera import Camera, get_camera
 from .batoid_wcs import BatoidWCSBuilder
@@ -29,6 +30,18 @@ LSSTCam_filter_map = {'u': 'u_24',
                       'z': 'z_20',
                       'y': 'y_10'}
 
+# There are multiple u, g, and z filters for ComCam.
+# See https://github.com/lsst/obs_lsst/blob/w.2023.26/python/lsst/obs/lsst/filters.py#L352-L361
+# and https://jira.lsstcorp.org/browse/DM-21706
+# I chose the ones that made the most sense to me (JM)
+ComCam_filter_map = {
+    'u': 'u_05',
+    'g': 'g_01',
+    'r': 'r_03',
+    'i': 'i_06',
+    'z': 'z_03',
+    'y': 'y_04',
+}
 
 def make_batoid_wcs(ra0, dec0, rottelpos, obsmjd, band, camera_name,
                     logger=None):
@@ -50,7 +63,7 @@ def make_batoid_wcs(ra0, dec0, rottelpos, obsmjd, band, camera_name,
         One of `ugrizy`.
     camera_name : str ['LsstCam']
         Class name of the camera to be simulated.  Valid values are
-        'LsstCam', 'LsstComCam', 'LsstCamImSim'.
+        'LsstCam', 'LsstCamImSim', 'LsstComCamSim'.
     logger : logger.Logger [None]
         Logger object.
 
@@ -99,7 +112,7 @@ def compute_rotSkyPos(ra0, dec0, rottelpos, obsmjd, band,
         One of `ugrizy`.
     camera_name : str ['LsstCam']
         Class name of the camera to be simulated.  Valid values are
-        'LsstCam', 'LsstComCam', 'LsstCamImSim'.
+        'LsstCam', 'LsstCamImSim', 'LsstComCamSim'.
     dxy : float [100]
         Size (in pixels) of legs of the triangle to use for computing the
         angle between North and the +y direction in the focal plane.
@@ -215,7 +228,6 @@ def get_primary_hdu(eimage, lsst_num, camera_name=None,
     """
     phdu = fits.PrimaryHDU()
     phdu.header['RUNNUM'] = eimage.header['RUNNUM']
-    phdu.header['OBSID'] = eimage.header['OBSID']
     phdu.header['MJD'] = eimage.header['MJD']
     date = Time(eimage.header['MJD'], format='mjd')
     phdu.header['DATE'] = date.isot
@@ -239,6 +251,15 @@ def get_primary_hdu(eimage, lsst_num, camera_name=None,
     dectel = eimage.header['DECTEL']
     rottelpos = eimage.header['ROTTELPOS']
     band = eimage.header['FILTER']
+    # Compute rotSkyPos instead of using likely inconsistent values
+    # from the instance catalog or opsim db.
+    mjd_obs = eimage.header['MJD-OBS']
+    mjd_end =  mjd_obs + exptime/86400.
+    rotang = compute_rotSkyPos(
+        ratel, dectel, rottelpos, mjd_obs, band, camera_name=camera_name,
+        logger=logger
+    )
+    phdu.header['ROTANGLE'] = rotang
     if camera_name == 'LsstCamImSim':
         phdu.header['FILTER'] = band
         phdu.header['TESTTYPE'] = 'IMSIM'
@@ -246,6 +267,18 @@ def get_primary_hdu(eimage, lsst_num, camera_name=None,
         phdu.header['SENSNAME'] = sensor
         phdu.header['RATEL'] = ratel
         phdu.header['DECTEL'] = dectel
+        telcode = 'MC'
+    elif camera_name == 'LsstComCamSim' :
+        phdu.header['FILTER'] = ComCam_filter_map.get(band, None)
+        phdu.header['TELESCOP'] = SIMONYI_TELESCOPE
+        phdu.header['INSTRUME'] = 'ComCamSim'
+        phdu.header['RAFTBAY'] = raft
+        phdu.header['CCDSLOT'] = sensor
+        phdu.header['RA'] = ratel
+        phdu.header['DEC'] = dectel
+        phdu.header['ROTCOORD'] = 'sky'
+        phdu.header['ROTPA'] = rotang
+        telcode = 'CC'
     else:
         phdu.header['FILTER'] = LSSTCam_filter_map.get(band, None)
         phdu.header['INSTRUME'] = 'LSSTCam'
@@ -254,13 +287,11 @@ def get_primary_hdu(eimage, lsst_num, camera_name=None,
         phdu.header['RA'] = ratel
         phdu.header['DEC'] = dectel
         phdu.header['ROTCOORD'] = 'sky'
-    # Compute rotSkyPos instead of using likely inconsistent values
-    # from the instance catalog or opsim db.
-    mjd_obs = eimage.header['MJD-OBS']
-    mjd_end =  mjd_obs + exptime/86400.
-    phdu.header['ROTANGLE'] = compute_rotSkyPos(
-        ratel, dectel, rottelpos, mjd_obs, band, camera_name=camera_name,
-        logger=logger)
+        telcode = 'MC'
+    dayobs = eimage.header['DAYOBS']
+    seqnum = eimage.header['SEQNUM']
+    contrllr = eimage.header['CONTRLLR']
+    phdu.header['OBSID'] = f"{telcode}_{contrllr}_{dayobs}_{seqnum:06d}"
     phdu.header['MJD-OBS'] = mjd_obs
     phdu.header['HASTART'] = eimage.header['HASTART']
     phdu.header['HAEND'] = eimage.header['HAEND']
@@ -286,7 +317,7 @@ class CcdReadout:
     def __init__(self, eimage, logger, camera=None,
                  readout_time=2.0, dark_current=0.02, bias_level=1000.0,
                  scti=1.0e-6, pcti=1.0e-6, full_well=None, read_noise=None,
-                 bias_levels_file=None):
+                 bias_levels_file=None, added_keywords=None):
         """
         Parameters
         ----------
@@ -310,6 +341,9 @@ class CcdReadout:
             The name of json-formatted file with the per-amp bias levels.
             If provided, these values will supersede the single-valued
             bias_level parameter.
+        added_keywords : dict [None]
+            Dict with additional key, value pairs to include in primary
+            HDU header.
         """
         self.eimage = eimage
         self.det_name = eimage.header['DET_NAME']
@@ -340,6 +374,8 @@ class CcdReadout:
                             else cte_matrix(amp_bounds.xmax, scti))
         self.pcte_matrix = (None if pcti == 0
                             else cte_matrix(amp_bounds.ymax, pcti))
+
+        self.added_keywords = added_keywords
 
     def apply_cte(self, amp_images):
         """Apply CTI to a list of amp images."""
@@ -452,7 +488,8 @@ class CcdReadout:
 
         phdu = get_primary_hdu(self.eimage, self.ccd.getSerial(),
                                camera_name=self.camera_name,
-                               logger=self.logger)
+                               logger=self.logger,
+                               added_keywords=self.added_keywords)
         hdus = fits.HDUList(phdu)
         for amp_num, amp in enumerate(self.amp_images):
             channel = 'C' + channels[amp_num]
@@ -525,10 +562,15 @@ class CameraReadout(ExtraOutputBuilder):
             'pcti': float,
             'full_well': float,
             'read_noise': float,
-            'bias_levels_file': str,
+            'bias_levels_file': str
             }
-        ignore = ['file_name', 'dir', 'hdu', 'filter']
+        ignore = ['file_name', 'dir', 'hdu', 'filter', 'added_keywords']
         kwargs = GetAllParams(config, base, opt=opt, ignore=ignore)[0]
+
+        if 'added_keywords' in config:
+            kwargs['added_keywords'] = {}
+            for k in (added_keywords := config.get('added_keywords', {})):
+                kwargs['added_keywords'][k], safe = ParseValue(added_keywords, k, base, str)
 
         ccd_readout = CcdReadout(main_data[0], logger, **kwargs)
 

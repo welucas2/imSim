@@ -3,7 +3,7 @@ import os
 import warnings
 import astropy.time
 import galsim
-from galsim.config import OutputBuilder, RegisterOutputType
+from galsim.config import OutputBuilder, RegisterOutputType, ParseValue
 from .cosmic_rays import CosmicRays
 from .meta_data import data_dir
 from .camera import get_camera
@@ -175,9 +175,8 @@ class LSST_CCDBuilder(OutputBuilder):
         dayobs = astropy.time.Time(mjd_obs, format='mjd').strftime('%Y%m%d')
         image.header['DAYOBS'] = dayobs
         image.header['SEQNUM'] = seqnum
-        image.header['CONTRLLR'] = 'P', 'simulated data'
+        image.header['CONTRLLR'] = 'S', 'simulated data'
         image.header['RUNNUM'] = parse('observationId', int, -999)
-        image.header['OBSID'] = f"IM_P_{dayobs}_{seqnum:06d}"
         image.header['IMGTYPE'] = parse('image_type', str, 'SKYEXP')
         image.header['REASON'] = parse('reason', str, 'survey')
         image.header['RATEL'] = ratel
@@ -187,7 +186,7 @@ class LSST_CCDBuilder(OutputBuilder):
             warnings.simplefilter('ignore')
             image.header['ROTTELPOS'] = parse('rotTelPos', float, 0.0)
         image.header['FILTER'] = parse('band', str, 'N/A/')
-        image.header['CAMERA'] = base['output']['camera']
+        image.header['CAMERA'] = ParseValue(base['output'], 'camera', base, str)
         image.header['HASTART'] = opsim_data.getHourAngle(mjd_obs, ratel)
         image.header['HAEND'] = opsim_data.getHourAngle(mjd_end, ratel)
         image.header['AMSTART'] = airmass
