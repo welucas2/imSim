@@ -138,6 +138,8 @@ class LSST_PhotonPoolingImageBuilder(LSST_ImageBuilderBase):
         imview = full_image._view()
         imview._shift(-full_image.center)  # equiv. to setCenter(), but faster
         imview.wcs = PixelScale(1.0)
+        if 'scattered_photons' in base['output']:
+            base['scattered_photons'] = [] # Initialize the scattered_photons list
         for batch_num, batch in enumerate(phot_batches, start=current_photon_batch_num):
             if not batch:
                 continue
@@ -159,6 +161,16 @@ class LSST_PhotonPoolingImageBuilder(LSST_ImageBuilderBase):
             # Later iterations can skip any setup in sensor accumulation.
             resume = True
 
+            # Gather non-accumulated photons if we're going to be outputting them.
+            if 'scattered_photons' in base['output']:
+                scattered_indices = [i for i in range(len(photons)) if not imview.bounds.includes(photons.x[i], photons.y[i])]
+                if len(scattered_indices) > 0:
+                    scattered_photons = galsim.PhotonArray(len(scattered_indices))
+                    scattered_photons.copyFrom(photons, target_indices=slice(len(scattered_indices)), source_indices=scattered_indices)
+                    base['scattered_photons'].append(scattered_photons)
+                # print('Out of {0} total photons in this batch, {1} were scattered'.format(len(photons), len(scattered_indices)))
+                print('scatterd: {0} {1} {2} {3} {4}'.format(base['image']['det_name']['current'][0], batch_num, len(batch), len(photons), len(scattered_indices)))
+            
             # Note: in typical imsim usage, all current_vars will be 0. So this normally doesn't
             # add much to the checkpointing data.
             nz_var = np.nonzero(current_vars)[0]
