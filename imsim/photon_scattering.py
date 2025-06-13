@@ -24,7 +24,7 @@ class ScatteredPhotonsBuilder(ExtraOutputBuilder):
         # photon arrays to a single one and store in data, indexing by image number.
         if 'scattered_photons' in base and len(base['scattered_photons']) > 1:
             self.data[index] = galsim.PhotonArray.concatenate(base['scattered_photons'])
-            # We need to store the pixels' using focal plane coordinates so they
+            # We need to store the photons using focal plane coordinates so they
             # can be accumulated in the second pass on an arbitrary sensor.
             detector = get_camera(base['output']['camera'])[base['det_name']]
             self.data[index].x, self.data[index].y = pixel_to_focal(self.data[index].x, self.data[index].y, detector)
